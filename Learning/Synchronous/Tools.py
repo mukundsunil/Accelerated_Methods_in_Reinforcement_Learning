@@ -241,6 +241,46 @@ class policy_evaluation(metaclass=StaticMeta):
         mc_state_values = policy_evaluation.v(mdp, policy, gamma)
         reward = jnp.einsum("asx,axs->as", mdp.reward, mdp.transition)
         return (reward + gamma * jnp.einsum("axs,x->as", mdp.transition, mc_state_values))
+    
+class opt_val(metaclass=StaticMeta):
+
+    def v(mdp: MDP, gamma: float, n_iters: int = 20) -> VType:
+        """Compute optimal V-values via policy iteration.
+
+        Alternates greedy policy extraction and exact policy evaluation
+        for n_iters steps, converging to V*.
+
+        Args:
+            mdp: Tabular MDP instance.
+            gamma: Discount factor.
+            n_iters: Number of policy iteration steps.
+
+        Returns:
+            Optimal V-values with shape (S).
+        """
+        v = jnp.zeros((mdp.state_size))
+        for _ in range(n_iters):
+            v = policy_evaluation.v(mdp, greedy_policy.v(mdp, v, gamma), gamma)
+        return v
+    
+    def q(mdp: MDP, gamma: float, n_iters: int = 20) -> QType:
+        """Compute optimal Q-values via policy iteration.
+
+        Alternates greedy policy extraction and exact policy evaluation
+        for n_iters steps, converging to Q*.
+
+        Args:
+            mdp: Tabular MDP instance.
+            gamma: Discount factor.
+            n_iters: Number of policy iteration steps.
+
+        Returns:
+            Optimal Q-values with shape (A, S).
+        """
+        q = jnp.zeros((mdp.action_size, mdp.state_size))
+        for _ in range(n_iters):
+            q = policy_evaluation.q(mdp, greedy_policy.q(q), gamma)
+        return q
 
 
 def _markov_chain_pi(mdp: MDP, policy: PiType) -> tuple[F["SS"], F["SS"]]:

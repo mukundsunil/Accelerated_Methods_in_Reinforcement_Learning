@@ -14,6 +14,7 @@ from Tools import policy_evaluation as PE
 from Tools import greedy_policy as gp
 from Tools import sync_sample as sync
 from Tools import exp_decay as exp_decay
+from Tools import opt_val
 
 from jaxdp.mdp import MDP
 from jaxdp.mdp.grid_world import grid_world
@@ -24,7 +25,7 @@ from jaxdp.mdp.healthcare_mdp import healthcare_mdp
 
 from Algorithms import Transition, SyncSample, q_learning_sync, sql_sync, momentumq_sync, zap_ql_sync, r1_ql_sync
 from jaxdp.typehints import F, QType, VType, PiType, StaticMeta
-from utils import log_results_sync, plot_results, benchmark_log_results_sync, benchmark_plot_results, plot_comparative_results, log_results_sync
+from utils import log_results_sync, plot_results, benchmark_log_results_sync, benchmark_plot_results, benchmark_plot_val_err_results
 
 jax.config.update("jax_enable_x64", True) # Enables 64-bit floating-point precision (double precision)
 
@@ -44,11 +45,10 @@ class metrics(metaclass=StaticMeta):
         max_value_diff: jnp.ndarray
         expected_value: jnp.ndarray
         iteration: jnp.ndarray
+        val_err: jnp.ndarray
  
-    
-    
     def compute(prev: "loop.State", new : "loop.State", args: "loop.Args",
-            step: int, eval_results: "loop.EvalResult") -> "metrics.State":
+            step: int, eval_results: "loop.EvalResult", q_star: QType) -> "metrics.State":
         """
         Compute metrics for the current iteration
        
@@ -77,11 +77,11 @@ class metrics(metaclass=StaticMeta):
         bellman_res = jnp.max(jnp.abs(new_alg.q_vals - bellman_target))
         expected_value = jnp.einsum("as,as,s->", policy, new_alg.q_vals, args.mdp.initial) # Total Expected Value of a policy at the start of an episode
         expected_policy_eval = eval_results.policy_value
-        # value_error = jnp.linalg.norm(new_alg.q_vals - )/jnp.linalg.norm()
+        value_error = jnp.max(jnp.abs(new_alg.q_vals - q_star))/jnp.max(jnp.abs(q_star)) # Computation doubt
        
         return metrics.State(l1=l1, l2=l2, linf=linf,
                              bellman_res=bellman_res, iteration=step, expected_policy_eval=expected_policy_eval,
-                             expected_value=expected_value, max_value_diff=linf,
+                             expected_value=expected_value, max_value_diff=linf, val_err=value_error
                              )
 
 
@@ -110,8 +110,9 @@ class loop(metaclass=StaticMeta):
         mdp: MDP
         seed: int
         n_steps: int
-        eval_period: int = 1  # Evaluate every N steps (0 = no evaluation)
-        eval_seed: int = 42  # Seed for evaluation
+        eval_period: int  # Evaluate every N steps (0 = no evaluation)
+        n_seed: int   
+        gamma: jnp.ndarray
 
     @struct.dataclass
     class EvalResult:
@@ -135,7 +136,7 @@ class loop(metaclass=StaticMeta):
             alg_state=alg_state
         )
         
-    def train(state: "loop.State", args: "loop.Args") -> tuple["loop.State", Any]:
+    def train(state: "loop.State", args: "loop.Args", q_star: QType) -> tuple["loop.State", Any]:
         """Run training loop for n_steps with specified learning method
 
         Args:
@@ -160,7 +161,7 @@ class loop(metaclass=StaticMeta):
                                         lambda s: loop.EvalResult(policy_value=jnp.nan),
                                           new_state)
             
-            metrics_state = metrics.compute(prev, new_state, args, step, eval_results)
+            metrics_state = metrics.compute(prev, new_state, args, step, eval_results, q_star)
             return new_state, metrics_state
         
         keys = jrd.split(jrd.PRNGKey(args.seed), args.n_steps)
@@ -170,6 +171,45 @@ class loop(metaclass=StaticMeta):
         
         return final_state, all_metrics   
     
+    def train_vmap(state: "loop.State", args: "loop.Args", q_star: QType) -> tuple["loop.State", Any]:
+        """Run training loop for n_steps with specified learning method
+
+        Args:
+            state: Initial loop state
+            args: Loop arguments (includes value_fn, mdp)
+
+        Returns:
+            Final loop state and all metrics collected during training
+        """
+
+        def step_fn(state: loop.State, step_and_keys):
+            step, keys = step_and_keys
+            prev = state
+            reward, next_state, terminal = sync(args.mdp, keys)
+            sample = SyncSample(reward, next_state, terminal)
+            alpha = exp_decay(step)
+
+            vmap_upd = jax.vmap(args.value_fn.update, in_axes = (0, None, None, None))
+            new_alg_state = vmap_upd(state.alg_state, sample, alpha, step)
+            new_state = state.replace(alg_state=new_alg_state)
+
+            vmap_eval = jax.vmap(loop.evaluate, in_axes = (0, None))
+            eval_condn = (args.eval_period > 0) & ((step + 1) % args.eval_period == 0)
+            eval_results = jax.lax.cond(eval_condn, lambda s: vmap_eval(s, args), 
+                                        lambda s: loop.EvalResult(policy_value=jnp.full((args.n_seed,), jnp.nan)),
+                                          new_state)
+            
+            vmap_metrics = jax.vmap(metrics.compute, in_axes = (0, 0, None, None, None, 0))
+            metrics_state = vmap_metrics(prev, new_state, args, step, eval_results, q_star)
+            return new_state, metrics_state
+        
+        keys = jrd.split(jrd.PRNGKey(args.seed), args.n_steps)
+        keys = keys.reshape(args.n_steps, -1)
+        steps_and_keys = (jnp.arange(args.n_steps), keys)
+        final_state, all_metrics = jax.lax.scan(step_fn, state, steps_and_keys)
+        
+        return final_state, all_metrics  
+
     def evaluate(state: "loop.State", args: "loop.Args") -> "loop.EvalResult":
         """Evaluate the learned policy (greedy, no exploration)
 
@@ -227,10 +267,22 @@ def healthcare_MDP_create() -> MDP:
 
 ######################################################################################
 
+####################################### LOOP INPUTS ##################################
+
+hyperparams = {
+    "seed": 42,
+    "n_steps": 5000, 
+    "eval_period": 1, 
+    "n_seed": 5, 
+    "gamma": 0.9
+}
+######################################################################################
+
 ################################ ALGORITHM IMPLEMENTATION ############################
 
 def alg_implementation(alg_display_name, mdp_name, state, loop_args):
-    final_state, metrics = loop.train(state, loop_args)
+    q_star = opt_val.q(mdp, hyperparams["gamma"])
+    final_state, metrics = loop.train(state, loop_args, q_star)
     
     # Store and visualize results
     results = {f"{mdp_name}": (metrics, final_state.alg_state.q_vals)}
@@ -242,7 +294,10 @@ def alg_implementation(alg_display_name, mdp_name, state, loop_args):
 
 ################################ BENCHMARK IMPLEMENTATION ############################
 
-def benchmark_alg_implementation(mdp_name, mdp): # only pass mdp_name and mdp
+def benchmark_alg_implementation(mdp_name, mdp, hyperparams): # only pass mdp_name and mdp
+    
+    q_star = opt_val.q(mdp, hyperparams["gamma"])
+    q_star = jnp.broadcast_to(q_star, (hyperparams["n_seed"], mdp.action_size, mdp.state_size))
     
     alg_map = {
         q_learning_sync: "Q-Learning sync",
@@ -253,55 +308,31 @@ def benchmark_alg_implementation(mdp_name, mdp): # only pass mdp_name and mdp
     }
     
     avg_results = {}
+    all_results = {}
 
     for alg_module, alg_display_name in alg_map.items():
 
-        loop_args = loop.Args(value_fn = alg_module, mdp = mdp, seed=42, n_steps=5000)
-        init_state = loop_args.value_fn.init(mdp=mdp, key=jrd.PRNGKey(loop_args.seed), gamma=0.9)
+        loop_args = loop.Args(value_fn = alg_module, mdp = mdp, **hyperparams)
+        keys = jrd.split(jrd.PRNGKey(loop_args.seed), loop_args.n_seed)
+
+        vmap_init = jax.vmap(loop_args.value_fn.init, in_axes = (None, 0, None))
+        init_state = vmap_init(mdp, keys, loop_args.gamma)
         state = loop.init(init_state, loop_args)        
-        final_state, metrics = loop.train(state, loop_args)
+        final_state, metrics = loop.train_vmap(state, loop_args, q_star)
 
-        avg_results[alg_display_name] = metrics
+        avg_metrics = jax.tree.map(
+            lambda x: jnp.mean(x, axis=1) if x.ndim > 1 else x,
+            metrics
+        )
+        avg_results[alg_display_name] = avg_metrics
         print(f"Completed for {alg_display_name}")
-    gamma = 0.9
-    settings = {"name":mdp_name,"gamma": gamma}
+        all_results[alg_display_name] = metrics
+ 
+    settings = {"name":mdp_name,"gamma": loop_args.gamma}
     benchmark_log_results_sync(avg_results, settings)
-    benchmark_plot_results(avg_results, settings)
+    benchmark_plot_results(all_results, settings)
+    benchmark_plot_val_err_results(all_results, settings)
     return avg_results
-
-######################################################################################
-
-################################ ALGORITHM IMPLEMENTATION ############################
-
-def run_multiseed_benchmark(mdp_type, alg_list, mdp_map, n_seeds, n_steps):
-    """
-    Runs multiple algorithms across multiple seeds for a specific MDP.
-    """
-    comparison_results = {}
-
-    for alg_prefix, (alg_module, alg_name) in alg_list.items():
-        seed_metrics = []
-        
-        for seed in range(n_seeds):
-            print(f"Running {alg_name} on {mdp_type} - Seed {seed}")
-            
-            # Setup MDP and Loop
-            mdp_creator, mdp_params = mdp_map[mdp_type]
-            mdp = mdp_creator(**mdp_params)
-            loop_args = loop.Args(value_fn=alg_module, mdp=mdp, seed=seed, n_steps=n_steps)
-            
-            # Initialize and Train
-            init_state = loop_args.value_fn.init(mdp=mdp, key=seed, gamma=0.9)
-            state = loop.init(init_state, loop_args)
-            final_state, metrics = loop.train(state, loop_args)
-            
-            # Assuming metrics is a JAX array or dict of arrays (e.g., return/loss)
-            seed_metrics.append(metrics)
-            
-        comparison_results[alg_name] = seed_metrics
-
-    log_results_sync(comparison_results, alg_name)
-    plot_comparative_results(comparison_results, mdp_type)
 
 ######################################################################################
 
@@ -320,7 +351,7 @@ if __name__ == "__main__":
 
     mdp_map = {
         "grid": (grid_mdp_create, {}),
-        "garnet": (garnet_MDP_create, {"state_size": 200, "action_size": 5, "branch_size":10, "key": jrd.PRNGKey(42)}),
+        "garnet": (garnet_MDP_create, {"state_size": 50, "action_size": 5, "branch_size":10, "key": jrd.PRNGKey(42)}),
         "forest": (forest_MDP_create, {"rotation": 25}),
         "graph": (graph_MDP_create, {}),
         "healthcare": (healthcare_MDP_create, {})
@@ -337,21 +368,13 @@ if __name__ == "__main__":
     selected_alg_module = None
     selected_mdp_type = None
 
-    if args.benchmark_type.startswith("benchmark_alg"):
-
-        mdp_type = args.benchmark_type[len("benchmark_alg")+1:]
-        mdp_creator, mdp_params = mdp_map[mdp_type]
-        mdp = mdp_creator(**mdp_params)
-        mdp_name = mdp_type.capitalize() 
-        run_multiseed_benchmark(mdp_type, alg_map, mdp_map, n_seeds=5, n_steps=5000)
-
-    elif args.benchmark_type.startswith("benchmarkalg"):
+    if args.benchmark_type.startswith("benchmarkalg"):
 
         mdp_type = args.benchmark_type[len("benchmarkalg")+1:]
         mdp_creator, mdp_params = mdp_map[mdp_type]
         mdp = mdp_creator(**mdp_params)
         mdp_name = mdp_type.capitalize() 
-        benchmark_alg_implementation(mdp_name, mdp)
+        benchmark_alg_implementation(mdp_name, mdp, hyperparams)
         
     else:
         
@@ -367,9 +390,9 @@ if __name__ == "__main__":
         mdp_creator, mdp_params = mdp_map[mdp_type]
         mdp = mdp_creator(**mdp_params)
         mdp_name = mdp_type.capitalize()
-        loop_args = loop.Args(value_fn = alg_module, mdp = mdp, seed=42, n_steps=5000)
+        loop_args = loop.Args(value_fn = alg_module, mdp = mdp, **hyperparams)
 
-        init_state = loop_args.value_fn.init(mdp=mdp, key=loop_args.seed, gamma=0.9)
+        init_state = loop_args.value_fn.init(mdp, jrd.PRNGKey(loop_args.seed), loop_args.gamma)
         state = loop.init(init_state, loop_args)
 
         alg_implementation(alg_display_name, mdp_name, state, loop_args) 
