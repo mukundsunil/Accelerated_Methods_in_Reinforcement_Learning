@@ -86,6 +86,9 @@ def benchmark_plot_results(avg_results, settings):
   
     mdp_name = settings["name"]
     gamma = settings["gamma"]
+    S = settings["S"]
+    A = settings["A"]
+    b = settings["b"]
     plt.figure(figsize=(10, 6))
     cmap = plt.get_cmap('tab10')
 
@@ -96,7 +99,7 @@ def benchmark_plot_results(avg_results, settings):
         plt.plot(iters, bellman_res, color=color, alpha=0.5, linewidth=0.1)
 
         mean_res = jnp.mean(bellman_res, axis=1)
-        plt.plot(iters, mean_res, color=color, linewidth=1, label=f"{alg_name}")
+        plt.plot(iters, mean_res, color=color, linewidth=1)
 
         std_res = jnp.std(bellman_res, axis=1)
         lower_bound = mean_res - std_res 
@@ -105,22 +108,25 @@ def benchmark_plot_results(avg_results, settings):
        
     plt.xscale('log')
     plt.yscale('log')
-    plt.title(f"Benchmark {mdp_name} for gamma={gamma}")
-    plt.xlabel("Iterations")
-    plt.ylabel("Bellman Residual")
+    plt.title(f"Benchmark {mdp_name} for gamma={gamma}", fontsize=16, fontweight='bold')
+    plt.xlabel("Iterations", fontsize=18)
+    plt.ylabel("Bellman Residual", fontsize=18)
     plt.grid(True, which="both", linestyle='--', alpha=0.5)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
+    # plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    # plt.tight_layout()
     
-    save_path = f"Images/Benchmark_alg_BE_{mdp_name}_{gamma}_plot.png"
+    save_path = f"Images/Benchmark_alg_BE_{mdp_name}_{S}_{A}_{b}_{gamma}_plot.png"
     plt.savefig(save_path, dpi=300)
-    plt.close('all') # Explicitly close all figure objects
+    plt.close('all')
     print(f"Plot saved to {save_path}")
 
 def benchmark_plot_val_err_results(avg_results, settings):
   
     mdp_name = settings["name"]
     gamma = settings["gamma"]
+    S = settings["S"]
+    A = settings["A"]
+    b = settings["b"]
     plt.figure(figsize=(10, 6))
     cmap = plt.get_cmap('tab10')
 
@@ -131,7 +137,7 @@ def benchmark_plot_val_err_results(avg_results, settings):
         plt.plot(iters, val_err, color=color, alpha=0.5, linewidth=0.1)
 
         mean_res = jnp.mean(val_err, axis=1)
-        plt.plot(iters, mean_res, color=color, linewidth=1, label=f"{alg_name}")
+        plt.plot(iters, mean_res, color=color, linewidth=1)
 
         std_res = jnp.std(val_err, axis=1)
         lower_bound = mean_res - std_res 
@@ -141,13 +147,13 @@ def benchmark_plot_val_err_results(avg_results, settings):
     plt.xscale('log')
     plt.yscale('log')
     plt.title(f"Benchmark {mdp_name} for gamma={gamma}")
-    plt.xlabel("Iterations")
-    plt.ylabel("Value Error")
+    plt.xlabel("Iterations", fontsize=18)
+    plt.ylabel("Value Error", fontsize=18)
     plt.grid(True, which="both", linestyle='--', alpha=0.5)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
+    # plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    # plt.tight_layout()
     
-    save_path = f"Images/Benchmark_alg_VE_{mdp_name}_{gamma}_plot.png"
+    save_path = f"Images/Benchmark_alg_VE_{mdp_name}_{S}_{A}_{b}_{gamma}_plot.png"
     plt.savefig(save_path, dpi=300)
     plt.close('all') # Explicitly close all figure objects
     print(f"Plot saved to {save_path}")

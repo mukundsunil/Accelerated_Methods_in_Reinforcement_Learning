@@ -33,6 +33,10 @@ class SyncSample:
     terminal: F["AS"] # Terminal flag. This is to signify the value of the terminal state which has 0. 
 
 class q_learning_sync(metaclass=StaticMeta):
+    r"""
+    Synchronous Q-Learning. The update equation is taken from the paper: "Q-Learning"
+    https://link.springer.com/article/10.1023/A:1022676722315
+    """
 
     @struct.dataclass
     class State:
@@ -63,6 +67,10 @@ class q_learning_sync(metaclass=StaticMeta):
         return state.replace(q_vals=next_q)
 
 class sql_sync(metaclass=StaticMeta):
+    r"""
+    Synchronous Speedy Q-Learning. The update equation is taken from the paper: "Speedy Q-Learning"
+    https://proceedings.neurips.cc/paper_files/paper/2011/file/ab1a4d0dd4d48a2ba1077c4494791306-Paper.pdf
+    """
 
     @struct.dataclass
     class State:
@@ -97,6 +105,10 @@ class sql_sync(metaclass=StaticMeta):
         return state.replace(q_vals = next_q, prev_q = state.q_vals)
 
 class momentumq_sync(metaclass=StaticMeta):
+    r"""
+    Synchronous Momentum Q-Learning. The update equation is taken from the paper: "Finite-Time Theory for Momentum Q-learning"
+    https://proceedings.mlr.press/v161/bowen21a.html
+    """
 
     @struct.dataclass
     class State:
@@ -136,6 +148,12 @@ class momentumq_sync(metaclass=StaticMeta):
         return state.replace(q_vals = next_q, prev_q = state.q_vals)
     
 class zap_ql_sync(metaclass=StaticMeta):
+    r"""
+    Synchronous Momentum Q-Learning. The original idea of Zap Q-Learing is taken fom the paper: "Zap Q-Learning"
+    https://proceedings.neurips.cc/paper_files/paper/2017/file/4671aeaf49c792689533b00664a5c3ef-Paper.pdf
+    To obtain the implemented algorithm below, the \lambda value in Zap-Q(\lambda) is made zero
+    and a synchronous update is considered
+    """
 
     @struct.dataclass
     class State:
@@ -174,6 +192,10 @@ class zap_ql_sync(metaclass=StaticMeta):
         return state.replace(q_vals = next_q, matrix_gain=next_matrix_gain)
     
 class r1_ql_sync(metaclass=StaticMeta):
+    r"""
+    Synchronous Rank-1 Q-Learning. The update equation is taken from the paper: "RANK-ONE MODIFIED VALUE ITERATION"
+    https://arxiv.org/abs/1905.09963
+    """
 
     @struct.dataclass
     class State:
@@ -208,10 +230,50 @@ class r1_ql_sync(metaclass=StaticMeta):
         pdf_approx = jnp.einsum("asx,asu,as->ux", sample.next_state, next_action, state.pdf) 
         prev_pdf = state.pdf
         pdf = state.pdf + alpha * (pdf_approx - state.pdf) # what is beta
-        lamb = (state.gamma * alpha)/(1-state.gamma) * jnp.einsum("as,as->", delta, pdf)
+        lamb = (state.gamma)/(1-state.gamma) * jnp.einsum("as,as->", delta, pdf)
         next_q = state.q_vals + (delta + lamb) * alpha
 
         return state.replace(q_vals = next_q, pdf=pdf)
+    
+class shi_ql_sync(metaclass=StaticMeta):
+    r"""
+    Synchronous Halpern Q-Learning. The update equation is taken from the paper: "STOCHASTIC HALPERN ITERATION IN NORMED SPACES AND APPLICATIONS
+    TO REINFORCEMENT LEARNING"
+    https://arxiv.org/abs/2403.12338
+    The mini-batch sequence is considered to be equal to 1
+    """
+
+    @struct.dataclass
+    class State:
+        q_vals: QType
+        q_init: QType
+        gamma: jnp.ndarray
+        # b = jnp.ndarray
+
+    def init(mdp: MDP, key: jrd.PRNGKey, gamma: jnp.ndarray) -> "shi_ql_sync.State":
+
+        q_vals = jrd.uniform(key, (mdp.action_size,mdp.state_size), 
+                             dtype = 'float', minval =0.0, maxval = 1.0)
+
+        return shi_ql_sync.State(q_vals=q_vals, q_init=q_vals, gamma=gamma) # q_0 and q_-1 are initialized to the same value
+    
+    def q_target(next_state: F["S"], reward: F[""], terminal: F[""], q_vals: F["AS"], gamma: F[""]) -> F[""]:
+
+        q_next = jnp.einsum("s,as->a", next_state, q_vals)
+        max_q_next = jnp.max((1.0 - terminal) * q_next)
+        target = reward + gamma * max_q_next
+
+        return target
+    
+    def update(state: "shi_ql_sync.State", sample: "SyncSample", alpha, step) -> "shi_ql_sync.State":
+        
+        batched_q_target = jax.vmap(jax.vmap(shi_ql_sync.q_target, (0, 0, 0, None, None)), (0, 0, 0, None, None))
+        q_batched_target = batched_q_target(sample.next_state, sample.reward, sample.terminal, state.q_vals,
+                                          state.gamma)
+        beta = step/(step+1)  
+        next_q = (1-beta) * state.q_init + beta * q_batched_target
+
+        return state.replace(q_vals = next_q)
 
 
         

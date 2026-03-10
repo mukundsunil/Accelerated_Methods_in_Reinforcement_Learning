@@ -2,51 +2,34 @@ import jax
 import jax.numpy as jnp
 import jax.random as jrd
 from flax import struct
+from typing import Any
 import chex
 from chex import dataclass
+import rlax 
+import tyro
 
 from jaxtor.env.tabular import TabularEnv
 from jaxdp.typehints import F, QType, StaticMeta
 
-@struct.dataclass
-class Transition:
-    """
-    Dataclass for MDP Transition
-    
-    Contains information regarding one single transition 
-    
-    Attributes:
-            obs: Current observation.
-            act: Action taken.
-            rew: Reward received.
-            term: Terminal flag (episode ended naturally).
-            trun: Truncated flag (episode ended due to time limit).
-            nobs: Next observation.
-            
-    """
-    obs: chex.Array
-    act: chex.Array
-    rew: chex.Array
-    term: chex.Array
-    trun: chex.Array
-    nobs: chex.Array
+class q_learning_async:
 
-class q_learning_async(metaclass=StaticMeta):
-
-    @struct.dataclass
+    @dataclass
     class alg_State:
-        q_val: QType
+        q_vals: QType
         gamma: jnp.ndarray
 
-    def init(mdp: TabularEnv, key: jrd.PRNGKey, gamma: jnp.ndarray) -> "q_learning_async.alg_State":
+    def init(env_state: TabularEnv.State, gamma: jnp.ndarray) -> "q_learning_async.alg_State":
         
-        q_val = jnp.zeros((mdp.act_space.shape[0], mdp.obs_space.shape[0]))
+        q_vals = jnp.zeros((env_state.mdp.action_size, env_state.mdp.state_size))
 
-        return q_learning_async.alg_State(q_val=q_val, gamma=gamma)
+        return q_learning_async.alg_State(q_vals=q_vals, gamma=gamma)
     
-    def update(state: "q_learning_async.alg_State", trans: Transition, alpha)  -> "q_learning_async.alg_State": 
+    def update(state: "q_learning_async.alg_State", trans: Any, alpha)  -> "q_learning_async.alg_State": 
         
-        td_error = trans.rew + state.gamma*jnp.max(state.q_val[:, trans.nobs]) - state.q_val[trans.act, trans.obs] 
-        next_q = state.q_val.at[trans.act, trans.obs].set(state.q_val[trans.act, trans.obs] + alpha * td_error)
+        discount = jnp.where(trans.term, 0.0, state.gamma)
+        td_err = rlax.q_learning(
+            state.q_vals[:, trans.obs], trans.act, trans.rew, discount, state.q_vals[:, trans.nobs]
+        )
+        next_q = state.q_vals.at[trans.act, trans.obs].add(alpha * td_err)
 
-        return state.replace(q_val=next_q)
+        return state.replace(q_vals=next_q)

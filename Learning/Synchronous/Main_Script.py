@@ -23,7 +23,7 @@ from jaxdp.mdp.forest_mdp import forest_mdp
 from jaxdp.mdp.simple_graph import graph_mdp
 from jaxdp.mdp.healthcare_mdp import healthcare_mdp
 
-from Algorithms import Transition, SyncSample, q_learning_sync, sql_sync, momentumq_sync, zap_ql_sync, r1_ql_sync
+from Algorithms import Transition, SyncSample, q_learning_sync, sql_sync, momentumq_sync, zap_ql_sync, r1_ql_sync, shi_ql_sync
 from jaxdp.typehints import F, QType, VType, PiType, StaticMeta
 from utils import log_results_sync, plot_results, benchmark_log_results_sync, benchmark_plot_results, benchmark_plot_val_err_results
 
@@ -77,7 +77,7 @@ class metrics(metaclass=StaticMeta):
         bellman_res = jnp.max(jnp.abs(new_alg.q_vals - bellman_target))
         expected_value = jnp.einsum("as,as,s->", policy, new_alg.q_vals, args.mdp.initial) # Total Expected Value of a policy at the start of an episode
         expected_policy_eval = eval_results.policy_value
-        value_error = jnp.max(jnp.abs(new_alg.q_vals - q_star))/jnp.max(jnp.abs(q_star)) # Computation doubt
+        value_error = jnp.max(jnp.abs(new_alg.q_vals - q_star)) # Computation doubt
        
         return metrics.State(l1=l1, l2=l2, linf=linf,
                              bellman_res=bellman_res, iteration=step, expected_policy_eval=expected_policy_eval,
@@ -236,10 +236,10 @@ def grid_mdp_create() -> MDP:
     board = [
     "########",
     "#  @#  #",
-    "#  ## +#",
+    "#  ##  #",
     "#      #",
     "#X     #",
-    "#+   P #",
+    "#    P #",
     "#     X#",
     "########"
     ]
@@ -274,7 +274,7 @@ hyperparams = {
     "n_steps": 5000, 
     "eval_period": 1, 
     "n_seed": 5, 
-    "gamma": 0.9
+    "gamma": 0.999
 }
 ######################################################################################
 
@@ -301,10 +301,11 @@ def benchmark_alg_implementation(mdp_name, mdp, hyperparams): # only pass mdp_na
     
     alg_map = {
         q_learning_sync: "Q-Learning sync",
+        r1_ql_sync: "Rank 1 Q-Learning sync",
         sql_sync: "Speedy Q-Learning sync",
         momentumq_sync: "Momentum Q sync",
         zap_ql_sync: "Zap Q-Learning sync",
-        r1_ql_sync: "Rank 1 Q-Learning sync",
+        shi_ql_sync: "Halpern Q-Learning sync",
     }
     
     avg_results = {}
@@ -328,7 +329,7 @@ def benchmark_alg_implementation(mdp_name, mdp, hyperparams): # only pass mdp_na
         print(f"Completed for {alg_display_name}")
         all_results[alg_display_name] = metrics
  
-    settings = {"name":mdp_name,"gamma": loop_args.gamma}
+    settings = {"name":mdp_name,"gamma": loop_args.gamma, "S": mdp.state_size, "A": mdp.action_size, "b": 15}
     benchmark_log_results_sync(avg_results, settings)
     benchmark_plot_results(all_results, settings)
     benchmark_plot_val_err_results(all_results, settings)
@@ -345,13 +346,14 @@ if __name__ == "__main__":
                 "momentumq_sync_grid", "momentumq_sync_garnet", "momentumq_sync_forest", "momentumq_sync_graph", "momentumq_sync_healthcare",
                 "zap_ql_sync_grid", "zap_ql_sync_garnet", "zap_ql_sync_forest", "zap_ql_sync_graph", "zap_ql_sync_healthcare",
                 "r1_ql_sync_grid", "r1_ql_sync_garnet", "r1_ql_sync_forest", "r1_ql_sync_graph", "r1_ql_sync_healthcare",
-                "benchmarkalg_grid", "benchmarkalg_garnet", "benchmark_alg_grid", "benchmark_alg_garnet"],
+                "shi_ql_sync_grid", "shi_ql_sync_garnet", "shi_ql_sync_forest", "shi_ql_sync_graph", "shi_ql_sync_healthcare",
+                "benchmarkalg_grid", "benchmarkalg_garnet", "benchmarkalg_forest", "benchmarkalg_graph", "benchmarkalg_healthcare"],
         help="Type of benchmark to run")
     args = parser.parse_args()
 
     mdp_map = {
         "grid": (grid_mdp_create, {}),
-        "garnet": (garnet_MDP_create, {"state_size": 50, "action_size": 5, "branch_size":10, "key": jrd.PRNGKey(42)}),
+        "garnet": (garnet_MDP_create, {"state_size": 50, "action_size": 5, "branch_size":15, "key": jrd.PRNGKey(42)}),
         "forest": (forest_MDP_create, {"rotation": 25}),
         "graph": (graph_MDP_create, {}),
         "healthcare": (healthcare_MDP_create, {})
@@ -363,6 +365,7 @@ if __name__ == "__main__":
         "momentumq_sync": (momentumq_sync, "Momentum Q sync"),
         "zap_ql_sync": (zap_ql_sync, "Zap Q-Learning sync"),
         "r1_ql_sync": (r1_ql_sync, "Rank 1 Q-Learning sync"),
+        "shi_ql_sync": (shi_ql_sync, "Halpern Q-Learning sync")
     }
 
     selected_alg_module = None
