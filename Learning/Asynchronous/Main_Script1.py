@@ -1,4 +1,6 @@
 from __future__ import annotations
+from typing import Any
+
 
 import dataclasses
 import time
@@ -16,12 +18,12 @@ from rich.progress import track
 from jaxtor.env.tabular import garnet
 from jaxtor.eval.tabular import Eval as Evaluator, optimal_q
 from jaxtor.sampler import Imc, Mc
-
+from Algorithms import q_learning_async
 @dataclass 
 class Config:
     """Training configuration for tyro CLI"""
 
-    garnet: garnet.Config = dataclasses.field(default_factory=garnet.Config)
+    garnet: garnet.Config = dataclasses.field(default_factory=garnet.Config) # I want to make this an input. Ex: alg_MDP is the input, it gets the MDP from here
     n_steps: int = 1_000_000
     alpha_init: float = 0.5
     alpha_power: float = 0.25 # what is this
@@ -40,13 +42,11 @@ class Agent:
     @dataclass
     class State:
         key: chex.Array
-        q_vals: chex.Array # size is (A, S)
-        matrix_gain: chex.Array # size is (AS, AS)
-        # g: chex.Array # size is (A, S)
+        alg_state: Any
 
     def q_vals(self, state: Agent.State, obs: chex.Array) -> chex.Array:
         """Q-values for given state indices."""
-        return state.q_vals[:, obs]
+        return state.alg_state.q_vals[:, obs]
     
     def act(
         self, obs: chex.Array, state: Agent.State
@@ -54,55 +54,18 @@ class Agent:
         """ε-greedy action selection."""
         key, act_key, explore_key = jrd.split(state.key, 3)
         greedy = jnp.argmax(self.q_vals(state, obs))
-        random = jrd.randint(act_key, (), 0, state.q_vals.shape[0])
+        random = jrd.randint(act_key, (), 0, state.alg_state.q_vals.shape[0])
         action = jnp.where(jrd.uniform(explore_key) < self.epsilon, random, greedy)
         return action, state.replace(key=key)
     
 @jax.jit
-def train_step_ql(state: Imc.State, k: int) -> Imc.State:
+def train_step(state: Imc.State, k: int) -> Imc.State:
     """One transition + Q-learning update with decaying step size."""
  
     trans, state = imc.sample(state)
-    q_vals = state.agent.q_vals
     alpha = cfg.alpha_init / (1.0 + k / cfg.alpha_period) ** cfg.alpha_power
-    discount = jnp.where(trans.term, 0.0, cfg.gamma)
-    td = rlax.q_learning(
-        q_vals[:, trans.obs], trans.act, trans.rew, discount, q_vals[:, trans.nobs] # TD Error is being calculated here
-    )
-    new_q = q_vals.at[trans.act, trans.obs].add(alpha * td)
-    return state.replace(agent=state.agent.replace(q_vals=new_q))
-
-@jax.jit
-def train_step_zap_ql(state: Imc.State, k: int) -> Imc.State:
-    """One transition + ZAP Q-learning update with decaying step size."""
- 
-    trans, state = imc.sample(state)
-    q_vals = state.agent.q_vals
-    # alpha = cfg.alpha_init / (1.0 + k / cfg.alpha_period) ** cfg.alpha_power
-    alpha = 1.0/(1.0+k)
-    beta = 1.0/((2.0+k)**0.99)
-    discount = jnp.where(trans.term, 0.0, cfg.gamma)
-    nact = jnp.argmax(q_vals[:, trans.nobs])
-
-    # \hat{A_{k+1}} approximation. Here \hat{A_{k+1}} is (I - \gamma P_hat) 
-    E_zeros = jnp.zeros([cfg.garnet.action_size, cfg.garnet.state_size, cfg.garnet.action_size, cfg.garnet.state_size]) # 4-D Tensor
-    E = E_zeros.at[trans.act, trans.obs, trans.act, trans.obs].set(1) # setting one at (a,s,a,s)
-    E_reshape = E.reshape(cfg.garnet.action_size*cfg.garnet.state_size, cfg.garnet.action_size*cfg.garnet.state_size) # reshaping it to (as, as)
-    P_hat = jnp.zeros((cfg.garnet.action_size, cfg.garnet.state_size, cfg.garnet.action_size, cfg.garnet.state_size))
-    P_hat_upd = P_hat.at[trans.act, trans.obs, nact, trans.nobs].set(1.0) # setting one at (a,s,a',s^+)
-    step_matrix_gain = (E_reshape - cfg.gamma*(P_hat_upd.reshape(cfg.garnet.action_size*cfg.garnet.state_size, cfg.garnet.action_size*cfg.garnet.state_size))) # (E - \gamma P)
-    next_matrix_gain = state.agent.matrix_gain + beta * (step_matrix_gain - state.agent.matrix_gain) # SA update of (I - \gamma P) and shape is (as, as)
-    
-    td_error = rlax.q_learning(
-        q_vals[:, trans.obs], trans.act, trans.rew, discount, q_vals[:, trans.nobs]
-    )
-    g= jnp.zeros((A, S))
-    g_flat = (g.at[trans.act, trans.obs].set(td_error)).flatten()
-    pre_td_err = jnp.linalg.solve(next_matrix_gain, g_flat).reshape(cfg.garnet.action_size, cfg.garnet.state_size)
-    # new_q = q_vals.at[trans.act, trans.obs].add(alpha * pre_td_err[trans.act, trans.obs])
-    new_q = q_vals + alpha * pre_td_err
-    
-    return state.replace(agent=state.agent.replace(q_vals=new_q, matrix_gain=next_matrix_gain, ))
+    new_alg_state = q_learning_async.update(state.agent.alg_state, trans, alpha)
+    return state.replace(agent=state.agent.replace(alg_state=new_alg_state))
 
 cfg = tyro.cli(Config)
 S, A = cfg.garnet.state_size, cfg.garnet.action_size
@@ -126,7 +89,7 @@ opt_rho = float(jnp.sum(env_state.mdp.initial * jnp.max(opt_q, axis=0)))
 
 evaluator = Evaluator(mdp=env_state.mdp, gamma=cfg.gamma, agent=agent)
 jit_eval = jax.jit(evaluator.metric)
-agent_state = Agent.State(key=agent_key, q_vals=jnp.zeros((A, S)), matrix_gain = jnp.eye(env_state.mdp.action_size*env_state.mdp.state_size),)
+agent_state = Agent.State(key=agent_key, alg_state=q_learning_async.init(env_state.mdp, cfg.gamma))
 imc_state = imc.init(mc=imc.mc.init(agent_key, env_state), agent=agent_state)
 eval_state = evaluator.init(agent_state)
 
@@ -134,7 +97,7 @@ print(f"[bold green]Q-learning on Garnet[/bold green] ({S}S, {A}A)")
 
 t0 = time.time()
 for k in track(range(cfg.n_steps), description="Training"):
-    imc_state = train_step_ql(imc_state, k)
+    imc_state = train_step(imc_state, k)
 
     if (k + 1) % cfg.eval_freq == 0:
         m, eval_state = jit_eval(eval_state, opt_q, imc_state.agent)

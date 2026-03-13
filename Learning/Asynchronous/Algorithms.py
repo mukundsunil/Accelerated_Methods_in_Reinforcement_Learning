@@ -18,9 +18,9 @@ class q_learning_async:
         q_vals: QType
         gamma: jnp.ndarray
 
-    def init(env_state: TabularEnv.State, gamma: jnp.ndarray) -> "q_learning_async.alg_State":
+    def init(mdp: TabularEnv.State, gamma: jnp.ndarray) -> "q_learning_async.alg_State":
         
-        q_vals = jnp.zeros((env_state.mdp.action_size, env_state.mdp.state_size))
+        q_vals = jnp.zeros((mdp.action_size, mdp.state_size))
 
         return q_learning_async.alg_State(q_vals=q_vals, gamma=gamma)
     
