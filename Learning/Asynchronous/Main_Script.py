@@ -1,4 +1,6 @@
 from __future__ import annotations
+from typing import Any
+import argparse
 
 import dataclasses
 import time
@@ -13,23 +15,14 @@ from chex import dataclass
 from rich import print
 from rich.progress import track
 
-from jaxtor.env.tabular import garnet
+from jaxdp.mdp import MDP as JaxdpMDP
+from tabular_env import TabularEnv, garnet, graph
 from jaxtor.eval.tabular import Eval as Evaluator, optimal_q
-from jaxtor.sampler import Imc, Mc
+from jaxtor.sampler import Imc, Mc, random_sweep
+from Algorithms import q_learning_async, zap_q_learning_async, pre_cond_q_learning_async
+from utils import plot_results, plot_VE_results, plot_opt_rho_results, benchmark_plot_results, benchmark_plot_results_VE
 
-@dataclass 
-class Config:
-    """Training configuration for tyro CLI"""
-
-    garnet: garnet.Config = dataclasses.field(default_factory=garnet.Config)
-    n_steps: int = 1_000_000
-    alpha_init: float = 0.5
-    alpha_power: float = 0.25 # what is this
-    alpha_period: float = 10_000 # what is this
-    gamma: float = 0.99
-    epsilon: float = 0.1
-    eval_freq: int = 10_000 
-    seed: int = 0
+jax.config.update("jax_enable_x64", True)
 
 @dataclass
 class Agent:
@@ -40,13 +33,15 @@ class Agent:
     @dataclass
     class State:
         key: chex.Array
-        q_vals: chex.Array # size is (A, S)
-        matrix_gain: chex.Array # size is (AS, AS)
-        # g: chex.Array # size is (A, S)
+        alg_state: Any
 
+    @dataclass
+    class Args:
+        value_fn: Any
+   
     def q_vals(self, state: Agent.State, obs: chex.Array) -> chex.Array:
         """Q-values for given state indices."""
-        return state.q_vals[:, obs]
+        return state.alg_state.q_vals[:, obs]
     
     def act(
         self, obs: chex.Array, state: Agent.State
@@ -54,101 +49,271 @@ class Agent:
         """ε-greedy action selection."""
         key, act_key, explore_key = jrd.split(state.key, 3)
         greedy = jnp.argmax(self.q_vals(state, obs))
-        random = jrd.randint(act_key, (), 0, state.q_vals.shape[0])
+        random = jrd.randint(act_key, (), 0, state.alg_state.q_vals.shape[0])
         action = jnp.where(jrd.uniform(explore_key) < self.epsilon, random, greedy)
         return action, state.replace(key=key)
-    
-@jax.jit
-def train_step_ql(state: Imc.State, k: int) -> Imc.State:
+
+   
+@jax.jit(static_argnames=("agent_args",))
+def train_step(state: Imc.State, k: int, agent_args) -> Imc.State:
     """One transition + Q-learning update with decaying step size."""
  
     trans, state = imc.sample(state)
-    q_vals = state.agent.q_vals
     alpha = cfg.alpha_init / (1.0 + k / cfg.alpha_period) ** cfg.alpha_power
-    discount = jnp.where(trans.term, 0.0, cfg.gamma)
-    td = rlax.q_learning(
-        q_vals[:, trans.obs], trans.act, trans.rew, discount, q_vals[:, trans.nobs] # TD Error is being calculated here
-    )
-    new_q = q_vals.at[trans.act, trans.obs].add(alpha * td)
-    return state.replace(agent=state.agent.replace(q_vals=new_q))
+    new_alg_state = agent_args.update(state.agent.alg_state, trans, alpha, k)
+    return state.replace(agent=state.agent.replace(alg_state=new_alg_state))
 
-@jax.jit
-def train_step_zap_ql(state: Imc.State, k: int) -> Imc.State:
-    """One transition + ZAP Q-learning update with decaying step size."""
+@jax.jit(static_argnames=("agent_args_value_fn",))
+def rand_train_step(state: Agent.State, env_state: JaxdpMDP, k, agent_args_value_fn, key) -> Agent.State:
+    """Random-access transition + Q-learning update with decaying step size."""
  
-    trans, state = imc.sample(state)
-    q_vals = state.agent.q_vals
-    # alpha = cfg.alpha_init / (1.0 + k / cfg.alpha_period) ** cfg.alpha_power
-    alpha = 1.0/(1.0+k)
-    beta = 1.0/((2.0+k)**0.99)
-    discount = jnp.where(trans.term, 0.0, cfg.gamma)
-    nact = jnp.argmax(q_vals[:, trans.nobs])
+    key, sampler_key = jrd.split(key, 2)
+    trans, mc_state = ran_sweep.sample(sampler_key, env_state) 
+    new_env_state = mc_state.env
+    alpha = cfg.alpha_init / (1.0 + k / cfg.alpha_period) ** cfg.alpha_power
+    new_alg_state = agent_args_value_fn.update(state.alg_state, trans, alpha, k)
+    return state.replace(alg_state=new_alg_state), key, new_env_state
+    
 
-    # \hat{A_{k+1}} approximation. Here \hat{A_{k+1}} is (I - \gamma P_hat) 
-    E_zeros = jnp.zeros([cfg.garnet.action_size, cfg.garnet.state_size, cfg.garnet.action_size, cfg.garnet.state_size]) # 4-D Tensor
-    E = E_zeros.at[trans.act, trans.obs, trans.act, trans.obs].set(1) # setting one at (a,s,a,s)
-    E_reshape = E.reshape(cfg.garnet.action_size*cfg.garnet.state_size, cfg.garnet.action_size*cfg.garnet.state_size) # reshaping it to (as, as)
-    P_hat = jnp.zeros((cfg.garnet.action_size, cfg.garnet.state_size, cfg.garnet.action_size, cfg.garnet.state_size))
-    P_hat_upd = P_hat.at[trans.act, trans.obs, nact, trans.nobs].set(1.0) # setting one at (a,s,a',s^+)
-    step_matrix_gain = (E_reshape - cfg.gamma*(P_hat_upd.reshape(cfg.garnet.action_size*cfg.garnet.state_size, cfg.garnet.action_size*cfg.garnet.state_size))) # (E - \gamma P)
-    next_matrix_gain = state.agent.matrix_gain + beta * (step_matrix_gain - state.agent.matrix_gain) # SA update of (I - \gamma P) and shape is (as, as)
-    
-    td_error = rlax.q_learning(
-        q_vals[:, trans.obs], trans.act, trans.rew, discount, q_vals[:, trans.nobs]
-    )
-    g= jnp.zeros((A, S))
-    g_flat = (g.at[trans.act, trans.obs].set(td_error)).flatten()
-    pre_td_err = jnp.linalg.solve(next_matrix_gain, g_flat).reshape(cfg.garnet.action_size, cfg.garnet.state_size)
-    # new_q = q_vals.at[trans.act, trans.obs].add(alpha * pre_td_err[trans.act, trans.obs])
-    new_q = q_vals + alpha * pre_td_err
-    
-    return state.replace(agent=state.agent.replace(q_vals=new_q, matrix_gain=next_matrix_gain, ))
+######################################################################################
+
+####################################### LOOP INPUTS ##################################
+
+@dataclass 
+class Config:
+    """Training configuration for tyro CLI"""
+
+    benchmark_type: str 
+    garnet: garnet.Config = dataclasses.field(default_factory=garnet.Config) # I want to make this an input. Ex: alg_MDP is the input, it gets the MDP from here
+    graph: graph.Config = dataclasses.field(default_factory=graph.Config) # I want to make this an input. Ex: alg_MDP is the input, it gets the MDP from here
+    n_steps: int = 1_000_000
+    alpha_init: float = 1
+    alpha_power: float = 1
+    alpha_period: float = 100
+    alpha_min: float = 0.0001
+    warmup_steps: int = 5_000
+    gamma: float = 0.999
+    epsilon: float = 0.1
+    eval_freq: int = 1_000 
+    seed: int = 0
 
 cfg = tyro.cli(Config)
-S, A = cfg.garnet.state_size, cfg.garnet.action_size
 
-agent = Agent(epsilon=cfg.epsilon)
-imc = Imc(
-    agent=agent,
-    mc=Mc(
-        max_episode_len=cfg.garnet.max_episode_len,
-        queue_size=20,
-        env=garnet.make(cfg.garnet),
-    ),
-)
+######################################################################################
 
-key = jrd.PRNGKey(cfg.seed)
-key, env_key, agent_key = jrd.split(key, 3)
-env_state = imc.mc.env.init(env_key)
+############################### ALGORITHM IMPLEMENTATION #############################
 
-opt_q = optimal_q(env_state.mdp, cfg.gamma)
-opt_rho = float(jnp.sum(env_state.mdp.initial * jnp.max(opt_q, axis=0)))
+def alg_implementation(imc_state, agent_args, eval_state, opt_q, opt_rho, alg_name):
 
-evaluator = Evaluator(mdp=env_state.mdp, gamma=cfg.gamma, agent=agent)
-jit_eval = jax.jit(evaluator.metric)
-agent_state = Agent.State(key=agent_key, q_vals=jnp.zeros((A, S)), matrix_gain = jnp.eye(env_state.mdp.action_size*env_state.mdp.state_size),)
-imc_state = imc.init(mc=imc.mc.init(agent_key, env_state), agent=agent_state)
-eval_state = evaluator.init(agent_state)
+    print(f"[bold green]{alg_name}")
+    results = {}
+    t0 = time.time()
+    for k in track(range(cfg.n_steps), description="Training"):
+        imc_state = train_step(imc_state, k, agent_args.value_fn)
 
-print(f"[bold green]Q-learning on Garnet[/bold green] ({S}S, {A}A)")
+        if (k + 1) % cfg.eval_freq == 0:
+            m, eval_state = jit_eval(eval_state, opt_q, imc_state.agent)
+            print(
+                f"  step {k + 1:6d}"
+                f"  bellman={float(m.bellman_linf):.4f}"
+                f"  value={float(m.value_norm):.4f}"
+                f"  ρ(π)={float(m.pi_eval_rho):.3f}"
+            )
+            results[k+1] = m
 
-t0 = time.time()
-for k in track(range(cfg.n_steps), description="Training"):
-    imc_state = train_step_ql(imc_state, k)
+    elapsed = time.time() - t0
+    print(
+        f"\n[bold green]Completed[/bold green] in {elapsed:.1f}s"
+        f"  value_norm={float(m.value_norm):.6f}"
+        f"  bellman_linf={float(m.bellman_linf):.6f}"
+        f"  ρ*(π)={opt_rho:.3f}"
+    )
+    print(f" Count of state-action pair = {imc_state.agent.alg_state.c}")
+    plot_results(results, alg_name)
+    plot_VE_results(results, alg_name)
+    return results
 
-    if (k + 1) % cfg.eval_freq == 0:
-        m, eval_state = jit_eval(eval_state, opt_q, imc_state.agent)
-        print(
-            f"  step {k + 1:6d}"
-            f"  bellman={float(m.bellman_linf):.4f}"
-            f"  value={float(m.value_norm):.4f}"
-            f"  ρ(π)={float(m.pi_eval_rho):.3f}"
+######################################################################################
+
+############################ ALGORITHM IMPLEMENTATION RAND ###########################
+
+def alg_implementation_rand(agent_state, env_state, agent_args, eval_state, opt_q, opt_rho, alg_name, key):
+
+    print(f"[bold green]{alg_name}")
+    results = {}
+    t0 = time.time()
+    for k in track(range(cfg.n_steps), description="Training"):
+        agent_state, key, env_state = rand_train_step(agent_state, env_state, k, agent_args.value_fn, key)
+
+        if (k + 1) % cfg.eval_freq == 0: 
+            m, eval_state = jit_eval(eval_state, opt_q, agent_state)        
+            print(
+                f"  step {k + 1:6d}"
+                f"  bellman={float(m.bellman_linf):.4f}"
+                f"  value error={float(m.value_norm):.4f}"
+                f"  ρ(π)={float(m.pi_eval_rho):.3f}"
+            )
+            
+            results[k+1] = m
+
+    elapsed = time.time() - t0
+    print(
+        f"\n[bold green]Completed[/bold green] in {elapsed:.1f}s"
+        f"  value error={float(m.value_norm):.6f}"
+        f"  bellman_linf={float(m.bellman_linf):.6f}"
+        f"  ρ*(π)={opt_rho:.3f}"
+    )
+    print(f" Count of state-action pair = {agent_state.alg_state.c}")
+    plot_results(results, alg_name)
+    plot_VE_results(results, alg_name)
+    plot_opt_rho_results(results, alg_name)
+    return results
+
+######################################################################################
+
+######################### ALGORITHM IMPLEMENTATION RAND VMAP #########################
+
+def alg_implementation_rand_vmap(agent_state, env_state, agent_args, eval_state, opt_q, opt_rho, alg_name, key):
+
+    print(f"[bold green]{alg_name}")
+    results = {}
+    t0 = time.time()
+    for k in track(range(cfg.n_steps), description="Training"):
+        agent_state, key, env_state = rand_train_step(agent_state, env_state, k, agent_args.value_fn, key)
+
+        if (k + 1) % cfg.eval_freq == 0: 
+            m, eval_state = jit_eval(eval_state, opt_q, agent_state)        
+            print(
+                f"  step {k + 1:6d}"
+                f"  bellman={float(m.bellman_linf):.4f}"
+                f"  value error={float(m.value_norm):.4f}"
+                f"  ρ(π)={float(m.pi_eval_rho):.3f}"
+            )
+            
+            results[k+1] = m
+
+    elapsed = time.time() - t0
+    print(
+        f"\n[bold green]Completed[/bold green] in {elapsed:.1f}s"
+        f"  value error={float(m.value_norm):.6f}"
+        f"  bellman_linf={float(m.bellman_linf):.6f}"
+        f"  ρ*(π)={opt_rho:.3f}"
+    )
+    print(f" Count of state-action pair = {agent_state.alg_state.c}")
+    plot_results(results, alg_name)
+    plot_VE_results(results, alg_name)
+    plot_opt_rho_results(results, alg_name)
+    return results
+
+######################################################################################
+
+############################## BENCHMARK IMPLEMENTATION  #############################
+
+def benchmark_rand(env_state, opt_q, opt_rho, key):
+
+    alg_map = {
+        q_learning_async: "Q-Learning (Random)",
+        zap_q_learning_async: "ZAP Q-Learning (Random)",
+        pre_cond_q_learning_async: "Pre-Cond Q-Learning (Random)",
+        }
+    all_results = {}
+
+    for alg_module, alg_name in alg_map.items():
+
+        agent_args = Agent.Args(value_fn=alg_module)
+        init_alg_state = agent_args.value_fn.init(env_state.mdp, cfg.gamma)
+        agent_state = Agent.State(key=agent_key, alg_state=init_alg_state)
+        eval_state = evaluator.init(agent_state)
+ 
+        results = alg_implementation_rand(agent_state, env_state, agent_args, eval_state, opt_q, opt_rho, alg_name, key)
+        all_results[alg_name] = results
+        print(f"Completed for {alg_name}")
+
+    benchmark_plot_results(all_results, cfg.gamma, cfg.eval_freq)
+    benchmark_plot_results_VE(all_results, cfg.gamma, cfg.eval_freq)
+    return all_results
+
+######################################################################################
+
+if __name__ == "__main__":
+    cfg = tyro.cli(Config)
+
+    # Map the CLI input to (Algorithm Module, Sampling Type, Display Name)
+    # sampling_type: 0 for trajectory (imc), 1 for sweep
+    alg_map = {
+        "q_learning_imc": (q_learning_async, 0, "Q-Learning (Trajectory)"),
+        "q_learning_rand": (q_learning_async, 1, "Q-Learning (Random)"),
+        "zap_ql_imc": (zap_q_learning_async, 0, "ZAP Q-Learning (Trajectory)"),
+        "zap_ql_rand": (zap_q_learning_async, 1, "ZAP Q-Learning (Random)"),
+        "pre_cond_ql_imc": (pre_cond_q_learning_async, 0, "Pre-Cond Q-Learning (Trajectory)"),
+        "pre_cond_ql_rand": (pre_cond_q_learning_async, 1, "Pre-Cond Q-Learning (Randoms)"),
+        "all_rand": (benchmark_rand, 1, "Full Benchmark")
+    }
+
+    if cfg.benchmark_type not in alg_map:
+        raise ValueError(f"Unknown Benchmark type: {cfg.benchmark_type}. "
+                         f"Available: {list(alg_map.keys())}")
+
+    alg_module, sampling_type, alg_name = alg_map[cfg.benchmark_type]
+
+    agent = Agent(epsilon=cfg.epsilon)
+    env=garnet.make(cfg.garnet)
+
+    
+
+    if sampling_type == 1:
+
+        mc_sampler = Mc(
+                    max_episode_len=cfg.graph.max_episode_len,
+                    queue_size=20,
+                    env=env,
+                    )
+        ran_sweep = random_sweep.RandomSweep(mc=mc_sampler)
+           
+        key = jrd.PRNGKey(cfg.seed)
+        key, env_key, agent_key = jrd.split(key, 3)
+        env_state = env.init(env_key)
+    
+        opt_q = optimal_q(env_state.mdp, cfg.gamma)
+        opt_rho = float(jnp.sum(env_state.mdp.initial * jnp.max(opt_q, axis=0)))
+    
+        evaluator = Evaluator(mdp=env_state.mdp, gamma=cfg.gamma, agent=agent)
+        jit_eval = jax.jit(evaluator.metric)
+        if alg_module == benchmark_rand:
+            benchmark_rand(env_state, opt_q, opt_rho, key)
+        else:
+            agent_args = Agent.Args(value_fn=alg_module)
+            init_alg_state = agent_args.value_fn.init(env_state.mdp, cfg.gamma)
+            agent_state = Agent.State(key=agent_key, alg_state=init_alg_state)
+            eval_state = evaluator.init(agent_state)
+    
+            alg_implementation_rand(agent_state, env_state, agent_args, eval_state, opt_q, opt_rho, alg_name, key)
+
+
+    else:
+
+        imc = Imc(
+        agent=agent,
+        mc=Mc(
+            max_episode_len=cfg.graph.max_episode_len,
+            queue_size=20,
+            env=env,
+            ),
         )
+           
+        key = jrd.PRNGKey(cfg.seed)
+        key, env_key, agent_key = jrd.split(key, 3)
+        env_state = imc.mc.env.init(env_key)
 
-elapsed = time.time() - t0
-print(
-    f"\n[bold green]Completed[/bold green] in {elapsed:.1f}s"
-    f"  value_norm={float(m.value_norm):.6f}"
-    f"  bellman_linf={float(m.bellman_linf):.6f}"
-    f"  ρ*(π)={opt_rho:.3f}"
-)
+        opt_q = optimal_q(env_state.mdp, cfg.gamma)
+        opt_rho = float(jnp.sum(env_state.mdp.initial * jnp.max(opt_q, axis=0)))
+
+        evaluator = Evaluator(mdp=env_state.mdp, gamma=cfg.gamma, agent=agent)
+        jit_eval = jax.jit(evaluator.metric)
+        agent_args = Agent.Args(value_fn=alg_module)
+        init_alg_state = agent_args.value_fn.init(env_state.mdp, cfg.gamma)
+        agent_state = Agent.State(key=agent_key, alg_state=init_alg_state)
+        imc_state = imc.init(mc=imc.mc.init(agent_key, env_state), agent=agent_state)
+        eval_state = evaluator.init(agent_state)
+
+        alg_implementation(imc_state, agent_args, eval_state, opt_q, opt_rho, alg_name)
