@@ -9,6 +9,8 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jrd
+import pickle
+import numpy as np
 import rlax 
 import tyro
 from chex import dataclass
@@ -16,11 +18,11 @@ from rich import print
 from rich.progress import track
 
 from jaxdp.mdp import MDP as JaxdpMDP
-from tabular_env import TabularEnv, garnet, graph
+from tabular_env import TabularEnv, garnet, graph, gridworld
 from jaxtor.eval.tabular import Eval as Evaluator, optimal_q
 from jaxtor.sampler import Imc, Mc, random_sweep
 from Algorithms import q_learning_async, zap_q_learning_async, pre_cond_q_learning_async
-from utils import plot_results, plot_VE_results, plot_opt_rho_results, benchmark_plot_results, benchmark_plot_results_VE
+from utils import plot_results, plot_all_trials, plot_VE_results, plot_all_trials_VE, plot_all_trials_opt_rho, plot_opt_rho_results
 
 jax.config.update("jax_enable_x64", True)
 
@@ -53,7 +55,21 @@ class Agent:
         action = jnp.where(jrd.uniform(explore_key) < self.epsilon, random, greedy)
         return action, state.replace(key=key)
 
-   
+def to_pure_dict(obj: Any) -> Any:
+    """Recursively converts any Pytree, Dataclass, or Metrics object into a pure nested dict."""
+    if hasattr(obj, "_asdict"):  # Handles NamedTuples or Metrics classes
+        return {k: to_pure_dict(v) for k, v in obj._asdict().items()}
+    elif dataclasses.is_dataclass(obj):
+        return {f.name: to_pure_dict(getattr(obj, f.name)) for f in dataclasses.fields(obj)}
+    elif hasattr(obj, "__dict__"): # Generic objects
+        return {k: to_pure_dict(v) for k, v in vars(obj).items() if not k.startswith('_')}
+    elif isinstance(obj, dict):
+        return {k: to_pure_dict(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [to_pure_dict(v) for v in obj]
+    else:
+        return obj
+       
 @jax.jit(static_argnames=("agent_args",))
 def train_step(state: Imc.State, k: int, agent_args) -> Imc.State:
     """One transition + Q-learning update with decaying step size."""
@@ -64,14 +80,14 @@ def train_step(state: Imc.State, k: int, agent_args) -> Imc.State:
     return state.replace(agent=state.agent.replace(alg_state=new_alg_state))
 
 @jax.jit(static_argnames=("agent_args_value_fn",))
-def rand_train_step(state: Agent.State, env_state: JaxdpMDP, k, agent_args_value_fn, key) -> Agent.State:
+def rand_train_step(state: Agent.State, env_state: JaxdpMDP, k, agent_args_value_fn, key, alpha_init, alpha_period, alpha_power, beta_power) -> Agent.State: # Remove beta_power for QL 
     """Random-access transition + Q-learning update with decaying step size."""
  
-    key, sampler_key = jrd.split(key, 2)
+    key, sampler_key = jrd.split(key, 2) # When batched, the key values are different for each seed, giving different results even if initialization is same
     trans, mc_state = ran_sweep.sample(sampler_key, env_state) 
     new_env_state = mc_state.env
-    alpha = cfg.alpha_init / (1.0 + k / cfg.alpha_period) ** cfg.alpha_power
-    new_alg_state = agent_args_value_fn.update(state.alg_state, trans, alpha, k)
+    alpha = alpha_init / (1.0 + k / alpha_period) ** alpha_power
+    new_alg_state = agent_args_value_fn.update(state.alg_state, trans, alpha, beta_power, k) # Remove beta_power for QL  
     return state.replace(alg_state=new_alg_state), key, new_env_state
     
 
@@ -86,18 +102,71 @@ class Config:
     benchmark_type: str 
     garnet: garnet.Config = dataclasses.field(default_factory=garnet.Config) # I want to make this an input. Ex: alg_MDP is the input, it gets the MDP from here
     graph: graph.Config = dataclasses.field(default_factory=graph.Config) # I want to make this an input. Ex: alg_MDP is the input, it gets the MDP from here
+    gridworld: gridworld.Config = dataclasses.field(
+    # Use a lambda to make it a callable factory
+    default_factory=lambda: gridworld.Config(
+        board = [
+                        "#####",
+                        "#  @#",
+                        "# # #",
+                        "#P  #",
+                        "#####"
+                    ],
+        p_slip=0.25
+    )
+)
     n_steps: int = 1_000_000
     alpha_init: float = 1
-    alpha_power: float = 1
-    alpha_period: float = 100
+    alpha_init: float = 1
+    # alpha_period: float = 1
+    # alpha_power: float = 1
+    
+    # QL
+    alpha_period: Any = dataclasses.field(
+        default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 10.0, 10.0, 10.0, 10.0, 100.0, 100.0, 100.0, 100.0, 1000.0, 1000.0, 1000.0, 1000.0]
+    )
+    
+    alpha_power: Any = dataclasses.field(
+        default_factory=lambda: [1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7]
+    )
+
+    # Pre and Zap
+    # alpha_period: Any = dataclasses.field(
+    #     default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 
+    #                              10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 
+    #                              100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 
+    #                              1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0]
+    # )
+    
+    # alpha_power: Any = dataclasses.field(
+    #     default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 0.9, 0.9, 0.9, 0.8, 0.8, 0.7, 
+    #                              1.0, 1.0, 1.0, 1.0, 0.9, 0.9, 0.9, 0.8, 0.8, 0.7,
+    #                              1.0, 1.0, 1.0, 1.0, 0.9, 0.9, 0.9, 0.8, 0.8, 0.7,
+    #                              1.0, 1.0, 1.0, 1.0, 0.9, 0.9, 0.9, 0.8, 0.8, 0.7,
+    #                              ]
+    # )
+
     alpha_min: float = 0.0001
+    beta_power: float = 0.9 # QL
+    # beta_power: Any = dataclasses.field(
+    #     default_factory=lambda: [0.9, 0.8, 0.7, 0.6, 0.8, 0.7, 0.6, 0.7, 0.6, 0.6, 
+    #                              0.9, 0.8, 0.7, 0.6, 0.8, 0.7, 0.6, 0.7, 0.6, 0.6,
+    #                              0.9, 0.8, 0.7, 0.6, 0.8, 0.7, 0.6, 0.7, 0.6, 0.6,
+    #                              0.9, 0.8, 0.7, 0.6, 0.8, 0.7, 0.6, 0.7, 0.6, 0.6,
+    #                              ]
+    # )
     warmup_steps: int = 5_000
-    gamma: float = 0.999
+    gamma: float = 0.99
     epsilon: float = 0.1
     eval_freq: int = 1_000 
     seed: int = 0
+    q_val_seed: int = 0
+    n_seed: int = 5
 
 cfg = tyro.cli(Config)
+alpha_power_array = jnp.array(cfg.alpha_power)
+alpha_period_array = jnp.array(cfg.alpha_period)
+# beta_power_array = jnp.array(cfg.beta_power)
 
 ######################################################################################
 
@@ -137,72 +206,19 @@ def alg_implementation(imc_state, agent_args, eval_state, opt_q, opt_rho, alg_na
 
 ############################ ALGORITHM IMPLEMENTATION RAND ###########################
 
-def alg_implementation_rand(agent_state, env_state, agent_args, eval_state, opt_q, opt_rho, alg_name, key):
+def alg_implementation_rand(agent_state, env_state, agent_args, eval_state, opt_q, opt_rho, alg_name, key, alpha_init, alpha_period, alpha_power, beta_power): # Remove beta_power for QL 
 
     print(f"[bold green]{alg_name}")
     results = {}
     t0 = time.time()
     for k in track(range(cfg.n_steps), description="Training"):
-        agent_state, key, env_state = rand_train_step(agent_state, env_state, k, agent_args.value_fn, key)
+        agent_state, key, env_state = rand_train_step(agent_state, env_state, k, agent_args.value_fn, key, alpha_init, alpha_period, alpha_power, beta_power) # Remove beta_power for QL 
 
         if (k + 1) % cfg.eval_freq == 0: 
-            m, eval_state = jit_eval(eval_state, opt_q, agent_state)        
-            print(
-                f"  step {k + 1:6d}"
-                f"  bellman={float(m.bellman_linf):.4f}"
-                f"  value error={float(m.value_norm):.4f}"
-                f"  ρ(π)={float(m.pi_eval_rho):.3f}"
-            )
-            
+            m, eval_state = jit_eval(eval_state, opt_q, agent_state)                    
             results[k+1] = m
 
     elapsed = time.time() - t0
-    print(
-        f"\n[bold green]Completed[/bold green] in {elapsed:.1f}s"
-        f"  value error={float(m.value_norm):.6f}"
-        f"  bellman_linf={float(m.bellman_linf):.6f}"
-        f"  ρ*(π)={opt_rho:.3f}"
-    )
-    print(f" Count of state-action pair = {agent_state.alg_state.c}")
-    plot_results(results, alg_name)
-    plot_VE_results(results, alg_name)
-    plot_opt_rho_results(results, alg_name)
-    return results
-
-######################################################################################
-
-######################### ALGORITHM IMPLEMENTATION RAND VMAP #########################
-
-def alg_implementation_rand_vmap(agent_state, env_state, agent_args, eval_state, opt_q, opt_rho, alg_name, key):
-
-    print(f"[bold green]{alg_name}")
-    results = {}
-    t0 = time.time()
-    for k in track(range(cfg.n_steps), description="Training"):
-        agent_state, key, env_state = rand_train_step(agent_state, env_state, k, agent_args.value_fn, key)
-
-        if (k + 1) % cfg.eval_freq == 0: 
-            m, eval_state = jit_eval(eval_state, opt_q, agent_state)        
-            print(
-                f"  step {k + 1:6d}"
-                f"  bellman={float(m.bellman_linf):.4f}"
-                f"  value error={float(m.value_norm):.4f}"
-                f"  ρ(π)={float(m.pi_eval_rho):.3f}"
-            )
-            
-            results[k+1] = m
-
-    elapsed = time.time() - t0
-    print(
-        f"\n[bold green]Completed[/bold green] in {elapsed:.1f}s"
-        f"  value error={float(m.value_norm):.6f}"
-        f"  bellman_linf={float(m.bellman_linf):.6f}"
-        f"  ρ*(π)={opt_rho:.3f}"
-    )
-    print(f" Count of state-action pair = {agent_state.alg_state.c}")
-    plot_results(results, alg_name)
-    plot_VE_results(results, alg_name)
-    plot_opt_rho_results(results, alg_name)
     return results
 
 ######################################################################################
@@ -221,7 +237,7 @@ def benchmark_rand(env_state, opt_q, opt_rho, key):
     for alg_module, alg_name in alg_map.items():
 
         agent_args = Agent.Args(value_fn=alg_module)
-        init_alg_state = agent_args.value_fn.init(env_state.mdp, cfg.gamma)
+        init_alg_state = agent_args.value_fn.init(env_state.mdp, cfg.gamma) 
         agent_state = Agent.State(key=agent_key, alg_state=init_alg_state)
         eval_state = evaluator.init(agent_state)
  
@@ -229,8 +245,8 @@ def benchmark_rand(env_state, opt_q, opt_rho, key):
         all_results[alg_name] = results
         print(f"Completed for {alg_name}")
 
-    benchmark_plot_results(all_results, cfg.gamma, cfg.eval_freq)
-    benchmark_plot_results_VE(all_results, cfg.gamma, cfg.eval_freq)
+    # benchmark_plot_results(all_results, cfg.gamma, cfg.eval_freq)
+    # benchmark_plot_results_VE(all_results, cfg.gamma, cfg.eval_freq)
     return all_results
 
 ######################################################################################
@@ -241,12 +257,12 @@ if __name__ == "__main__":
     # Map the CLI input to (Algorithm Module, Sampling Type, Display Name)
     # sampling_type: 0 for trajectory (imc), 1 for sweep
     alg_map = {
-        "q_learning_imc": (q_learning_async, 0, "Q-Learning (Trajectory)"),
-        "q_learning_rand": (q_learning_async, 1, "Q-Learning (Random)"),
-        "zap_ql_imc": (zap_q_learning_async, 0, "ZAP Q-Learning (Trajectory)"),
-        "zap_ql_rand": (zap_q_learning_async, 1, "ZAP Q-Learning (Random)"),
-        "pre_cond_ql_imc": (pre_cond_q_learning_async, 0, "Pre-Cond Q-Learning (Trajectory)"),
-        "pre_cond_ql_rand": (pre_cond_q_learning_async, 1, "Pre-Cond Q-Learning (Randoms)"),
+        "q_learning_imc": (q_learning_async, 0, "Q-Learning_(Trajectory)"),
+        "q_learning_rand": (q_learning_async, 1, "Q-Learning_(Random)"),
+        "zap_ql_imc": (zap_q_learning_async, 0, "ZAP_Q-Learning_(Trajectory)"),
+        "zap_ql_rand": (zap_q_learning_async, 1, "ZAP_Q-Learning_(Random)"),
+        "pre_cond_ql_imc": (pre_cond_q_learning_async, 0, "Pre-Cond_Q-Learning_(Trajectory)"),
+        "pre_cond_ql_rand": (pre_cond_q_learning_async, 1, "Pre-Cond_Q-Learning_(Randoms)"),
         "all_rand": (benchmark_rand, 1, "Full Benchmark")
     }
 
@@ -257,7 +273,7 @@ if __name__ == "__main__":
     alg_module, sampling_type, alg_name = alg_map[cfg.benchmark_type]
 
     agent = Agent(epsilon=cfg.epsilon)
-    env=garnet.make(cfg.garnet)
+    env=gridworld.make(cfg.gridworld) # Change MDP name here
 
     
 
@@ -282,13 +298,59 @@ if __name__ == "__main__":
         if alg_module == benchmark_rand:
             benchmark_rand(env_state, opt_q, opt_rho, key)
         else:
+            keys = jrd.split(jrd.PRNGKey(cfg.q_val_seed), cfg.n_seed)
+            # keys = jrd.PRNGKey(cfg.q_val_seed)
             agent_args = Agent.Args(value_fn=alg_module)
-            init_alg_state = agent_args.value_fn.init(env_state.mdp, cfg.gamma)
-            agent_state = Agent.State(key=agent_key, alg_state=init_alg_state)
-            eval_state = evaluator.init(agent_state)
-    
-            alg_implementation_rand(agent_state, env_state, agent_args, eval_state, opt_q, opt_rho, alg_name, key)
+            vmap_init = jax.vmap(agent_args.value_fn.init, in_axes = (None, 0, None)) 
+            init_alg_state = vmap_init(env_state.mdp, keys, cfg.gamma) # Batched initial state
+            vmap_agent = jax.vmap(lambda k, s: Agent.State(key=k, alg_state=s), in_axes = (None, 0))
+            agent_state = vmap_agent(agent_key, init_alg_state) # Batched agent state
+            vmap_eval = jax.vmap(evaluator.init, in_axes=(0))
+            eval_state = vmap_eval(agent_state) # Batched evaluator state
+            vmap_seeds = jax.vmap(alg_implementation_rand, 
+                                    in_axes=(0, None, None, 0, None, None, None, 0, None, None, None, None)) # 
+            vmap_trials = jax.vmap(vmap_seeds, 
+                                    in_axes=(None, None, None, None, None, None, None, None, None, 0, 0, None)) # Remove beta_power for QL , 0
+            # vmap_trials = vmap_seeds
+            all_results = vmap_trials(agent_state, env_state, agent_args, eval_state, opt_q, opt_rho, alg_name, keys, cfg.alpha_init, alpha_period_array, alpha_power_array, cfg.beta_power) # Remove beta_power for QL 
+            
+            results_cpu = jax.device_get(all_results)
+            sample_val = list(results_cpu.values())[0]
+            if dataclasses.is_dataclass(sample_val):
+                all_keys = [f.name for f in dataclasses.fields(sample_val)]
+            else:
+                # Fallback for standard objects
+                all_keys = [k for k in vars(sample_val).keys() if not k.startswith('_')]
 
+            structured_results = {}
+
+            for key in all_keys:
+                # Stack the metrics from every timestep into one big array
+                # We use getattr() to pull the specific metric (e.g., bellman_linf) from each Metrics object
+                metric_series = jnp.stack(
+                    [getattr(results_cpu[t], key) for t in sorted(results_cpu.keys())], 
+                    axis=-1
+                )
+                structured_results[key] = metric_series
+
+            for i in range(16): # make 16 for QL
+                trial_data = {
+                    "metrics": {k: v[i] for k, v in structured_results.items()},
+                    "alpha_power": cfg.alpha_power[i],
+                    "alpha_period": cfg.alpha_period[i],
+                    # "beta_power": cfg.beta_power[i], # Remove beta_power for QL
+                    "steps": list(sorted(results_cpu.keys())),
+                    "trial_id": i + 1
+                }
+
+                filename = f"{alg_name}_{cfg.gamma}_Trial_{i+1}_results.pkl"
+                with open(filename, "wb") as f:
+                    pickle.dump(trial_data, f)
+                print(f"Successfully saved {filename}")
+            
+            plot_all_trials(alg_name, cfg.gamma)
+            plot_all_trials_VE(alg_name, cfg.gamma)
+            plot_all_trials_opt_rho(alg_name, cfg.gamma, opt_rho)
 
     else:
 
