@@ -1,0 +1,22 @@
+Compiling Markov trajectory sampling strip for Garnet at gamma=0_999...
+None
+None
+None
+None
+None
+None
+None
+None
+None
+None
+None
+None
+None
+None
+None
+None
+None
+None
+None
+None
+Success! Markov strip heatmap saved to: ./plots/markov_heatmap_Garnet_0_999.png

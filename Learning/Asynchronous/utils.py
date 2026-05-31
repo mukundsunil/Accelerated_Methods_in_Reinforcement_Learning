@@ -266,6 +266,7 @@ def plot_comparison(paths, labels, metric='bellman_linf', opt_rho=None):
     # Metric-Specific Formatting
     if metric == 'pi_eval_rho':
         plt.ylabel(r'Policy Evaluation $\rho$', fontsize=12)
+        plt.ylim(bottom = opt_rho*0.9)
         if opt_rho is not None:
             plt.axhline(y=opt_rho, color='red', linestyle='--', linewidth=2, 
                         label=f'Optimal $\\rho$ ({opt_rho})')
@@ -278,6 +279,7 @@ def plot_comparison(paths, labels, metric='bellman_linf', opt_rho=None):
     elif metric == 'bellman_linf':
         plt.yscale('log')
         plt.xscale('log')
+        plt.ylim(top=1e1)
         plt.ylabel(r'Bellman $L_\infty$ Error (Log Scale)', fontsize=12)
 
     plt.xlabel('Steps', fontsize=12)

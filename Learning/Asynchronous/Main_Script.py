@@ -71,12 +71,12 @@ def to_pure_dict(obj: Any) -> Any:
         return obj
        
 @jax.jit(static_argnames=("agent_args",))
-def train_step(state: Imc.State, k: int, agent_args) -> Imc.State:
+def train_step(state: Imc.State, k: int, agent_args, alpha_init, alpha_period, alpha_power, beta_power) -> Imc.State:
     """One transition + Q-learning update with decaying step size."""
  
     trans, state = imc.sample(state)
-    alpha = cfg.alpha_init / (1.0 + k / cfg.alpha_period) ** cfg.alpha_power
-    new_alg_state = agent_args.update(state.agent.alg_state, trans, alpha, k)
+    alpha = alpha_init / (1.0 + k / alpha_period) ** alpha_power
+    new_alg_state = agent_args.value_fn.update(state.agent.alg_state, trans, alpha, alpha_power, beta_power, k) #Experimenting with learning rate for PCQL
     return state.replace(agent=state.agent.replace(alg_state=new_alg_state))
 
 @jax.jit(static_argnames=("agent_args_value_fn",))
@@ -87,7 +87,7 @@ def rand_train_step(state: Agent.State, env_state: JaxdpMDP, k, agent_args_value
     trans, mc_state = ran_sweep.sample(sampler_key, env_state) 
     new_env_state = mc_state.env
     alpha = alpha_init / (1.0 + k / alpha_period) ** alpha_power
-    new_alg_state = agent_args_value_fn.update(state.alg_state, trans, alpha, beta_power, k) # Remove beta_power for QL  
+    new_alg_state = agent_args_value_fn.update(state.alg_state, trans, alpha, alpha_power, beta_power, k) # Remove beta_power for QL  
     return state.replace(alg_state=new_alg_state), key, new_env_state
     
 
@@ -100,10 +100,9 @@ class Config:
     """Training configuration for tyro CLI"""
 
     benchmark_type: str 
-    garnet: garnet.Config = dataclasses.field(default_factory=garnet.Config) # I want to make this an input. Ex: alg_MDP is the input, it gets the MDP from here
-    graph: graph.Config = dataclasses.field(default_factory=graph.Config) # I want to make this an input. Ex: alg_MDP is the input, it gets the MDP from here
+    garnet: garnet.Config = dataclasses.field(default_factory=garnet.Config) 
+    graph: graph.Config = dataclasses.field(default_factory=graph.Config) 
     gridworld: gridworld.Config = dataclasses.field(
-    # Use a lambda to make it a callable factory
     default_factory=lambda: gridworld.Config(
         board = [
                         "#####",
@@ -117,20 +116,24 @@ class Config:
 )
     n_steps: int = 1_000_000
     alpha_init: float = 1
-    alpha_init: float = 1
+
+    #### SINGLE ####
     # alpha_period: float = 1
     # alpha_power: float = 1
+    # beta_power: float = 0.9 # QL
+    ################
     
-    # QL
-    alpha_period: Any = dataclasses.field(
-        default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 10.0, 10.0, 10.0, 10.0, 100.0, 100.0, 100.0, 100.0, 1000.0, 1000.0, 1000.0, 1000.0]
-    )
+    ############# RANDOM SAMPLING #################
+    # QL(16)
+    # alpha_period: Any = dataclasses.field(
+    #     default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 10.0, 10.0, 10.0, 10.0, 100.0, 100.0, 100.0, 100.0, 1000.0, 1000.0, 1000.0, 1000.0]
+    # )    
+    # alpha_power: Any = dataclasses.field(
+    #     default_factory=lambda: [1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7]
+    # )
+    # beta_power: float = 0.9 # QL
     
-    alpha_power: Any = dataclasses.field(
-        default_factory=lambda: [1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7, 1.0, 0.9, 0.8, 0.7]
-    )
-
-    # Pre and Zap
+    # Pre and Zap (40)
     # alpha_period: Any = dataclasses.field(
     #     default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 
     #                              10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 
@@ -146,8 +149,6 @@ class Config:
     #                              ]
     # )
 
-    alpha_min: float = 0.0001
-    beta_power: float = 0.9 # QL
     # beta_power: Any = dataclasses.field(
     #     default_factory=lambda: [0.9, 0.8, 0.7, 0.6, 0.8, 0.7, 0.6, 0.7, 0.6, 0.6, 
     #                              0.9, 0.8, 0.7, 0.6, 0.8, 0.7, 0.6, 0.7, 0.6, 0.6,
@@ -155,8 +156,40 @@ class Config:
     #                              0.9, 0.8, 0.7, 0.6, 0.8, 0.7, 0.6, 0.7, 0.6, 0.6,
     #                              ]
     # )
+
+    ################################################
+
+    ################## MC SAMPLING #################
+    # QL MC sampling (16)
+    # alpha_period: Any = dataclasses.field(
+    #     default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 10.0, 10.0, 10.0, 10.0, 100.0, 100.0, 100.0, 100.0, 1000.0, 1000.0, 1000.0, 1000.0]
+    # )
+    
+    # alpha_power: Any = dataclasses.field(
+    #     default_factory=lambda: [0.4, 0.3, 0.2, 0.1, 0.4, 0.3, 0.2, 0.1, 0.4, 0.3, 0.2, 0.1, 0.4, 0.3, 0.2, 0.1]
+    # )
+
+    # beta_power: float = 0.9 # QL
+
+    # Pre and Zap MC sampling (10)
+    
+    alpha_period: float = 1
+    
+    alpha_power: Any = dataclasses.field(
+        default_factory=lambda: [1.0, 1.0, 1.0, 1.0, 0.9, 0.9, 0.9, 0.8, 0.8, 0.7
+                                 ]
+    )
+
+    
+    beta_power: Any = dataclasses.field(
+        default_factory=lambda: [0.9, 0.8, 0.7, 0.6, 0.8, 0.7, 0.6, 0.7, 0.6, 0.6
+                                 ]
+    )
+    ################################################
+
+    alpha_min: float = 0.0001
     warmup_steps: int = 5_000
-    gamma: float = 0.99
+    gamma: float = 0.9
     epsilon: float = 0.1
     eval_freq: int = 1_000 
     seed: int = 0
@@ -166,7 +199,7 @@ class Config:
 cfg = tyro.cli(Config)
 alpha_power_array = jnp.array(cfg.alpha_power)
 alpha_period_array = jnp.array(cfg.alpha_period)
-# beta_power_array = jnp.array(cfg.beta_power)
+beta_power_array = jnp.array(cfg.beta_power)
 
 ######################################################################################
 
@@ -216,6 +249,25 @@ def alg_implementation_rand(agent_state, env_state, agent_args, eval_state, opt_
 
         if (k + 1) % cfg.eval_freq == 0: 
             m, eval_state = jit_eval(eval_state, opt_q, agent_state)                    
+            results[k+1] = m
+
+    elapsed = time.time() - t0
+    return results
+
+######################################################################################
+
+############################ ALGORITHM IMPLEMENTATION MC ###########################
+
+def alg_implementation_mc(imc_state, agent_args, eval_state, opt_q, opt_rho, alg_name, alpha_init, alpha_period, alpha_power, beta_power): # Remove beta_power for QL 
+
+    print(f"[bold green]{alg_name}")
+    results = {}
+    t0 = time.time()
+    for k in track(range(cfg.n_steps), description="Training"):
+        imc_state = train_step(imc_state, k, agent_args, alpha_init, alpha_period, alpha_power, beta_power) # Remove beta_power for QL 
+
+        if (k + 1) % cfg.eval_freq == 0:
+            m, eval_state = jit_eval(eval_state, opt_q, imc_state.agent)
             results[k+1] = m
 
     elapsed = time.time() - t0
@@ -273,7 +325,7 @@ if __name__ == "__main__":
     alg_module, sampling_type, alg_name = alg_map[cfg.benchmark_type]
 
     agent = Agent(epsilon=cfg.epsilon)
-    env=gridworld.make(cfg.gridworld) # Change MDP name here
+    env=garnet.make(cfg.garnet) # Change MDP name here
 
     
 
@@ -310,9 +362,9 @@ if __name__ == "__main__":
             vmap_seeds = jax.vmap(alg_implementation_rand, 
                                     in_axes=(0, None, None, 0, None, None, None, 0, None, None, None, None)) # 
             vmap_trials = jax.vmap(vmap_seeds, 
-                                    in_axes=(None, None, None, None, None, None, None, None, None, 0, 0, None)) # Remove beta_power for QL , 0
+                                    in_axes=(None, None, None, None, None, None, None, None, None, None, 0, 0)) # Remove beta_power for QL , 0
             # vmap_trials = vmap_seeds
-            all_results = vmap_trials(agent_state, env_state, agent_args, eval_state, opt_q, opt_rho, alg_name, keys, cfg.alpha_init, alpha_period_array, alpha_power_array, cfg.beta_power) # Remove beta_power for QL 
+            all_results = vmap_trials(agent_state, env_state, agent_args, eval_state, opt_q, opt_rho, alg_name, keys, cfg.alpha_init, cfg.alpha_period, alpha_power_array, beta_power_array) # Remove beta_power for QL 
             
             results_cpu = jax.device_get(all_results)
             sample_val = list(results_cpu.values())[0]
@@ -333,12 +385,12 @@ if __name__ == "__main__":
                 )
                 structured_results[key] = metric_series
 
-            for i in range(16): # make 16 for QL
+            for i in range(40): # make 16 for QL
                 trial_data = {
                     "metrics": {k: v[i] for k, v in structured_results.items()},
                     "alpha_power": cfg.alpha_power[i],
                     "alpha_period": cfg.alpha_period[i],
-                    # "beta_power": cfg.beta_power[i], # Remove beta_power for QL
+                    "beta_power": cfg.beta_power[i], # Remove beta_power for QL
                     "steps": list(sorted(results_cpu.keys())),
                     "trial_id": i + 1
                 }
@@ -372,10 +424,59 @@ if __name__ == "__main__":
 
         evaluator = Evaluator(mdp=env_state.mdp, gamma=cfg.gamma, agent=agent)
         jit_eval = jax.jit(evaluator.metric)
-        agent_args = Agent.Args(value_fn=alg_module)
-        init_alg_state = agent_args.value_fn.init(env_state.mdp, cfg.gamma)
-        agent_state = Agent.State(key=agent_key, alg_state=init_alg_state)
-        imc_state = imc.init(mc=imc.mc.init(agent_key, env_state), agent=agent_state)
-        eval_state = evaluator.init(agent_state)
 
-        alg_implementation(imc_state, agent_args, eval_state, opt_q, opt_rho, alg_name)
+        keys = jrd.split(jrd.PRNGKey(cfg.q_val_seed), cfg.n_seed)
+        # keys = jrd.PRNGKey(cfg.q_val_seed)
+        agent_args = Agent.Args(value_fn=alg_module)
+        vmap_init = jax.vmap(agent_args.value_fn.init, in_axes = (None, 0, None)) 
+        init_alg_state = vmap_init(env_state.mdp, keys, cfg.gamma) # Batched initial state
+        vmap_agent = jax.vmap(lambda k, s: Agent.State(key=k, alg_state=s), in_axes = (None, 0))
+        agent_state = vmap_agent(agent_key, init_alg_state) # Batched agent state
+        vmap_imc_state = jax.vmap(imc.init, in_axes = (None, 0))
+        imc_state = vmap_imc_state(imc.mc.init(agent_key, env_state), agent_state) # Batched imc state
+        vmap_eval = jax.vmap(evaluator.init, in_axes=(0))
+        eval_state = vmap_eval(agent_state) # Batched evaluator state
+        vmap_seeds = jax.vmap(alg_implementation_mc, 
+                                in_axes=(0, None, 0, None, None, None, None, None, None, None)) # 
+        vmap_trials = jax.vmap(vmap_seeds, 
+                                in_axes=(None, None, None, None, None, None, None, None, 0, 0)) # Remove beta_power for QL , 0
+        # vmap_trials = vmap_seeds
+        all_results = vmap_trials(imc_state, agent_args, eval_state, opt_q, opt_rho, alg_name, cfg.alpha_init, cfg.alpha_period, alpha_power_array, beta_power_array) # Remove beta_power for QL 
+        
+        results_cpu = jax.device_get(all_results)
+        sample_val = list(results_cpu.values())[0]
+        if dataclasses.is_dataclass(sample_val):
+            all_keys = [f.name for f in dataclasses.fields(sample_val)]
+        else:
+            # Fallback for standard objects
+            all_keys = [k for k in vars(sample_val).keys() if not k.startswith('_')]
+
+        structured_results = {}
+
+        for key in all_keys:
+            # Stack the metrics from every timestep into one big array
+            # We use getattr() to pull the specific metric (e.g., bellman_linf) from each Metrics object
+            metric_series = jnp.stack(
+                [getattr(results_cpu[t], key) for t in sorted(results_cpu.keys())], 
+                axis=-1
+            )
+            structured_results[key] = metric_series
+
+        for i in range(10): # make 4 for QL
+            trial_data = {
+                "metrics": {k: v[i] for k, v in structured_results.items()},
+                "alpha_power": cfg.alpha_power[i],
+                # "alpha_period": cfg.alpha_period[i],
+                "beta_power": cfg.beta_power[i], # Remove beta_power for QL
+                "steps": list(sorted(results_cpu.keys())),
+                "trial_id": i + 1
+            }
+
+            filename = f"{alg_name}_{cfg.gamma}_Trial_{i+1}_results.pkl"
+            with open(filename, "wb") as f:
+                pickle.dump(trial_data, f)
+            print(f"Successfully saved {filename}")
+        
+        plot_all_trials(alg_name, cfg.gamma)
+        plot_all_trials_VE(alg_name, cfg.gamma)
+        plot_all_trials_opt_rho(alg_name, cfg.gamma, opt_rho)
