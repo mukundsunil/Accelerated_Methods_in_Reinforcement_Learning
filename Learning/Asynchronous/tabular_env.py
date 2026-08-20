@@ -249,8 +249,9 @@ class gridworld:
             ... )
         """
 
-        board: list[str]
-        p_slip: float = 0.0
+        board: list[str] 
+        
+        p_slip: float = 0.25
         max_episode_len: int = 1000
 
         def init_mdp(self, key: chex.PRNGKey) -> JaxdpMDP:
